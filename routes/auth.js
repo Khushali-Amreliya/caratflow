@@ -3,8 +3,8 @@ const express = require("express");
 const bcrypt = require("bcryptjs");
 const jwt = require("jsonwebtoken");
 const { OAuth2Client } = require("google-auth-library");
-const mongoose = require("mongoose");
 const Firm = require("../models/Firm");
+const authMiddleware = require("../middleware/authMiddleware");
 
 const router = express.Router();
 
@@ -12,12 +12,10 @@ const googleClient = new OAuth2Client(
   process.env.GOOGLE_CLIENT_ID
 );
 
-// Generate our application's login token.
+// Generate JWT.
 function createToken(firm) {
   return jwt.sign(
-    {
-      sub: firm._id.toString(),
-    },
+    { sub: firm._id.toString() },
     process.env.JWT_SECRET,
     {
       expiresIn: "1h",
@@ -27,7 +25,7 @@ function createToken(firm) {
   );
 }
 
-// Return only safe user details.
+// Return safe user details.
 function publicUser(firm) {
   return {
     id: firm._id,
@@ -39,7 +37,7 @@ function publicUser(firm) {
   };
 }
 
-// 1. REGISTER FIRM
+// 1. REGISTER WITH EMAIL AND PASSWORD
 router.post("/register", async (req, res) => {
   try {
     const {
@@ -62,22 +60,20 @@ router.post("/register", async (req, res) => {
       });
     }
 
+    const normalizedEmail = email.trim().toLowerCase();
+
     if (
       !companyName.trim() ||
       !ownerName.trim() ||
       !mobile.trim() ||
-      !email.trim()
+      !normalizedEmail
     ) {
       return res.status(400).json({
         message: "All fields are required.",
       });
     }
 
-    const normalizedEmail = email.trim().toLowerCase();
-
-    if (
-      !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(normalizedEmail)
-    ) {
+    if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(normalizedEmail)) {
       return res.status(400).json({
         message: "Please enter a valid email address.",
       });
@@ -105,15 +101,12 @@ router.post("/register", async (req, res) => {
       });
     }
 
-    // Never save a plain-text password.
-    const hashedPassword = await bcrypt.hash(password, 12);
-
     const firm = await Firm.create({
       companyName: companyName.trim(),
       ownerName: ownerName.trim(),
       mobile: mobile.trim(),
       email: normalizedEmail,
-      password: hashedPassword,
+      password: await bcrypt.hash(password, 12),
       authProvider: "local",
     });
 
@@ -125,19 +118,18 @@ router.post("/register", async (req, res) => {
   } catch (error) {
     if (error.code === 11000) {
       return res.status(409).json({
-        message: "An account with this email or Google ID already exists.",
+        message: "An account with this email already exists.",
       });
     }
 
     console.error("Registration error:", error.message);
-
     return res.status(500).json({
       message: "Registration failed.",
     });
   }
 });
 
-// 2. SIGN IN WITH EMAIL AND PASSWORD
+// 2. LOGIN WITH EMAIL AND PASSWORD
 router.post("/login", async (req, res) => {
   try {
     const { email, password } = req.body;
@@ -157,19 +149,15 @@ router.post("/login", async (req, res) => {
       email: email.trim().toLowerCase(),
     }).select("+password");
 
-    // Use the same error for an unknown email or wrong password.
     if (!firm || !firm.password) {
       return res.status(401).json({
         message: "Invalid email or password.",
       });
     }
 
-    const passwordMatches = await bcrypt.compare(
-      password,
-      firm.password
-    );
+    const matches = await bcrypt.compare(password, firm.password);
 
-    if (!passwordMatches) {
+    if (!matches) {
       return res.status(401).json({
         message: "Invalid email or password.",
       });
@@ -182,28 +170,25 @@ router.post("/login", async (req, res) => {
     });
   } catch (error) {
     console.error("Login error:", error.message);
-
     return res.status(500).json({
       message: "Sign in failed.",
     });
   }
 });
 
-// 3. SIGN IN WITH GOOGLE (NO FIREBASE)
+// 3. GOOGLE SIGN-IN: NEW AND EXISTING USERS
+
+ // 3. GOOGLE SIGN-IN: NEW AND EXISTING USERS
 router.post("/google", async (req, res) => {
   try {
     const { credential } = req.body;
 
-    if (
-      typeof credential !== "string" ||
-      !credential
-    ) {
+    if (typeof credential !== "string" || !credential.trim()) {
       return res.status(400).json({
         message: "Google credential is required.",
       });
     }
 
-    // Verify the Google ID token with Google.
     const ticket = await googleClient.verifyIdToken({
       idToken: credential,
       audience: process.env.GOOGLE_CLIENT_ID,
@@ -223,46 +208,121 @@ router.post("/google", async (req, res) => {
     }
 
     const googleId = payload.sub;
-    const email = payload.email.toLowerCase();
+    const email = payload.email.trim().toLowerCase();
 
-    // Find an existing Google-linked account.
+    // 1. Check whether this Google account is already linked.
     let firm = await Firm.findOne({ googleId });
 
-    if (!firm) {
-      // Never silently link a Google account to an existing
-      // password account just because the email matches.
-      const existingFirm = await Firm.findOne({ email });
-
-      if (existingFirm) {
+    if (firm) {
+      // Do not sign in if the Google account's email does not match.
+      if (firm.email !== email) {
         return res.status(409).json({
-          message:
-            "An account already exists with this email. Please use your existing sign-in method.",
+          message: "Google account email does not match the linked account.",
         });
       }
 
-      // A new Google user must complete firm details later.
-      firm = await Firm.create({
-        companyName: "Pending firm details",
-        ownerName: payload.name || email.split("@")[0],
-        mobile: "",
-        email,
-        googleId,
-        authProvider: "google",
+      return res.status(200).json({
+        message: "Google sign-in successful.",
+        token: createToken(firm),
+        user: publicUser(firm),
+        isNewUser: false,
+        requiresFirmDetails:
+          firm.companyName === "Pending firm details",
       });
     }
 
-    return res.status(200).json({
-      message: "Google sign-in successful.",
+    // 2. Check whether this email already has an account.
+    firm = await Firm.findOne({ email });
+
+    if (firm) {
+      // Link the verified Google account to the existing account.
+      // The existing password remains unchanged.
+      firm.googleId = googleId;
+      await firm.save();
+
+      return res.status(200).json({
+        message: "Google account linked. Sign-in successful.",
+        token: createToken(firm),
+        user: publicUser(firm),
+        isNewUser: false,
+        requiresFirmDetails:
+          firm.companyName === "Pending firm details",
+      });
+    }
+
+    // 3. Create an account for a completely new Google user.
+    firm = await Firm.create({
+      companyName: "Pending firm details",
+      ownerName: payload.name || email.split("@")[0],
+      mobile: "",
+      email,
+      googleId,
+      authProvider: "google",
+    });
+
+    return res.status(201).json({
+      message: "Google account created and sign-in successful.",
       token: createToken(firm),
       user: publicUser(firm),
-      requiresFirmDetails:
-        firm.companyName === "Pending firm details",
+      isNewUser: true,
+      requiresFirmDetails: true,
+      requiresPasswordSetup: true,
     });
   } catch (error) {
+    if (error.code === 11000) {
+      return res.status(409).json({
+        message: "This Google account is already linked to another account.",
+      });
+    }
+
     console.error("Google sign-in error:", error.message);
 
     return res.status(401).json({
-      message: "Invalid or expired Google credential.",
+      message: "Google sign-in failed. Please try again.",
+    });
+  }
+});
+
+
+// 4. SET PASSWORD FOR A GOOGLE-CREATED ACCOUNT
+router.post("/set-password", authMiddleware, async (req, res) => {
+  try {
+    const { password } = req.body;
+
+    if (
+      typeof password !== "string" ||
+      password.length < 8 ||
+      password.length > 72
+    ) {
+      return res.status(400).json({
+        message: "Password must be 8-72 characters long.",
+      });
+    }
+
+    const firm = await Firm.findById(req.firmId).select("+password");
+
+    if (!firm) {
+      return res.status(404).json({
+        message: "Account not found.",
+      });
+    }
+
+    if (firm.password) {
+      return res.status(409).json({
+        message: "This account already has a password.",
+      });
+    }
+
+    firm.password = await bcrypt.hash(password, 12);
+    await firm.save();
+
+    return res.status(200).json({
+      message: "Password set successfully. You can now sign in using email and password.",
+    });
+  } catch (error) {
+    console.error("Set password error:", error.message);
+    return res.status(500).json({
+      message: "Could not set password.",
     });
   }
 });

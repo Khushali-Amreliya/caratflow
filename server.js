@@ -1,6 +1,7 @@
 
 require("dotenv").config();
 
+const authMiddleware = require("./middleware/authMiddleware");
 const express = require("express");
 const mongoose = require("mongoose");
 const cors = require("cors");
@@ -32,6 +33,12 @@ app.use(express.json({ limit: "10kb" }));
 app.get("/", (req, res) => {
   res.json({
     message: "CaratFlow Authentication API is running.",
+  });
+});
+app.get("/api/auth-test", authMiddleware, (req, res) => {
+  res.json({
+    message: "Authentication successful.",
+    firmId: req.firmId,
   });
 });
 
